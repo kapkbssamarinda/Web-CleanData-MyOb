@@ -223,8 +223,8 @@ if uploaded_file:
             
             # Persiapan Data Export
             df_export = df_result.copy()
-            for col in cols_to_format:
-                df_export[col] = df_export[col].apply(format_indo)
+            #for col in cols_to_format:
+            #    df_export[col] = df_export[col].apply(format_indo)
 
             c1, c2 = st.columns(2)
             with c1:

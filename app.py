@@ -1,365 +1,211 @@
 import streamlit as st
 import pandas as pd
-import re
+import csv
 import io
+import time
 
-# --- 1. Konfigurasi Halaman (UI/UX) ---
-st.set_page_config(
-    page_title="MYOB Data Cleaner",
-    page_icon="🧹",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS Sederhana (Hanya padding, tanpa warna background hardcoded agar aman di Dark Mode)
-st.markdown("""
-<style>
-    div.block-container {padding-top: 2rem;}
-</style>
-""", unsafe_allow_html=True)
-
-# --- 2. Fungsi Logika (Core Logic) ---
-
-def clean_currency_to_float(val):
-    """Konversi string kotor ke float dengan cerdas."""
-    if pd.isna(val) or val == '' or str(val).strip() == '':
-        return 0.0
+# Fungsi untuk membersihkan dan memformat nominal uang
+def clean_currency(val):
+    if not val or pd.isna(val) or str(val).strip() == "":
+        return "-"
     
-    val_str = str(val).strip()
-    is_negative = False
-    if '(' in val_str and ')' in val_str:
-        is_negative = True
-        val_str = val_str.replace('(', '').replace(')', '')
+    val = str(val).replace('Rp', '').replace('"', '').strip()
+    val = val.replace(',', '') 
     
-    val_str = re.sub(r'Rp|cr|dr|\s', '', val_str, flags=re.IGNORECASE)
-    
-    # Logika Separator
-    if ',' in val_str and '.' in val_str:
-        if val_str.rfind(',') > val_str.rfind('.'): 
-            val_str = val_str.replace('.', '').replace(',', '.')
-        else:
-            val_str = val_str.replace(',', '')
-    elif ',' in val_str:
-        parts = val_str.split(',')
-        if len(parts[-1]) == 2: 
-            val_str = val_str.replace(',', '.')
-        else: 
-            val_str = val_str.replace(',', '')
-    elif '.' in val_str:
-         parts = val_str.split('.')
-         if len(parts) > 1 and len(parts[-1]) == 3:
-             val_str = val_str.replace('.', '')
-    
-    try:
-        f_val = float(val_str)
-        return -f_val if is_negative else f_val
-    except ValueError:
-        return 0.0
-
-def format_indo(x):
-    """Format tampilan Indonesia (1.000,00)."""
-    try:
-        us_fmt = "{:,.2f}".format(x)
-        return us_fmt.replace(",", "X").replace(".", ",").replace("X", ".")
-    except:
-        return str(x)
-
-def process_myob_file(uploaded_file):
-    if uploaded_file.name.endswith('.csv'):
-        try:
-            df = pd.read_csv(uploaded_file, header=None, encoding='utf-8')
-        except:
-            df = pd.read_csv(uploaded_file, header=None, encoding='latin1')
-    else:
-        df = pd.read_excel(uploaded_file, header=None)
-
-    # Cari Header
-    header_idx = -1
-    for i, row in df.iterrows():
-        row_str = row.astype(str).str.cat(sep=' ')
-        if 'ID#' in row_str and 'Date' in row_str:
-            header_idx = i
-            break
-    
-    if header_idx == -1:
-        return None, "Header kolom (ID#, Date) tidak ditemukan dalam file."
-
-    df.columns = df.iloc[header_idx]
-    df_data = df.iloc[header_idx+1:].reset_index(drop=True)
-    df_data.columns = [str(c).strip() for c in df_data.columns]
-    
-    # Mapping Kolom
-    try:
-        col_id = 'ID#'
-        col_date = 'Date'
-        col_memo = 'Memo'
-        col_debit = 'Debit'
-        col_credit = 'Credit'
-        col_end_bal = 'Ending Balance'
-        col_src = 'Src' if 'Src' in df_data.columns else df_data.columns[2]
-    except KeyError as e:
-        return None, f"Kolom {e} tidak ditemukan."
-
-    cleaned_rows = []
-    current_account_name = None
-    
-    # Proses Iterasi
-    for index, row in df_data.iterrows():
-        id_val = str(row[col_id]).strip()
-        date_val = str(row[col_date]).strip()
-        memo_val = str(row[col_memo]).strip()
+    if val.endswith('.00'):
+        val = val[:-3]
+    if val.endswith('cr'):
+        val = val.replace('cr', '').strip()
         
-        # Header Akun
-        is_header_account = (
-            re.match(r'^\d-\d{4}', id_val) and 
-            (date_val == 'nan' or date_val == '')
-        )
+    try:
+        num = int(float(val))
+        if num == 0:
+            return "-"
+        return f"{num:,}".replace(",", ".")
+    except ValueError:
+        return val if val else "-"
 
-        if is_header_account:
-            possible_name = str(row.get(col_src, '')).strip()
-            if possible_name == 'nan' or possible_name == '':
-                possible_name = str(df_data.iloc[index, 2]).strip()
-            current_account_name = possible_name
-            continue 
+# Fungsi untuk membersihkan format tanggal
+def clean_date(val):
+    if not val:
+        return ""
+    return str(val).split(" ")[0].strip()
 
-        # Beginning Balance
-        if "Beginning Balance" in id_val:
-            val_src = row.get(col_src)
-            saldo_awal = clean_currency_to_float(val_src)
+# Fungsi utama untuk memproses baris data secara dinamis
+def process_gl_data(data_rows):
+    parsed_data = []
+    current_coa = ""
+    current_account = ""
+    start_reading = False
+    
+    idx_id, idx_date, idx_memo, idx_debit, idx_credit, idx_eb = 0, 2, 3, 4, 5, 8
+    
+    for row in data_rows:
+        clean_row = [str(cell).strip() for cell in row]
+        
+        if all(cell == "" for cell in clean_row):
+            continue
             
-            if saldo_awal == 0:
-                 val_end = clean_currency_to_float(row[col_end_bal])
-                 if val_end != 0: saldo_awal = val_end
-
-            cleaned_rows.append({
-                'ID': '-',
-                'Date': '01/01/2024',
-                'Memo': 'Beginning Balance',
-                'Debit': 0.0,
-                'Credit': 0.0,
-                'Ending Balance': saldo_awal,
-                'Nama Akun': current_account_name
+        if "ID#" in clean_row and "Date" in clean_row:
+            idx_id = clean_row.index("ID#")
+            idx_date = clean_row.index("Date")
+            idx_memo = clean_row.index("Memo")
+            idx_debit = clean_row.index("Debit")
+            idx_credit = clean_row.index("Credit")
+            
+            for i, col in enumerate(clean_row):
+                if "Ending Balance" in col:
+                    idx_eb = i
+                    break
+            
+            start_reading = True
+            continue
+            
+        if not start_reading:
+            continue
+            
+        coa_idx = -1
+        for i, cell in enumerate(clean_row):
+            if "-" in cell and cell[0].isdigit() and len(cell) >= 5:
+                coa_idx = i
+                break
+                
+        if coa_idx != -1 and (len(clean_row) > idx_date and clean_row[idx_date] == ""):
+            current_coa = clean_row[coa_idx]
+            current_account = ""
+            for cell in clean_row[coa_idx+1:]:
+                if cell != "":
+                    current_account = cell
+                    break
+            continue
+            
+        bb_idx = -1
+        for i, cell in enumerate(clean_row):
+            if "Beginning Balance" in cell:
+                bb_idx = i
+                break
+                
+        if bb_idx != -1:
+            memo = "Beginning Balance (Saldo Awal)"
+            balance = ""
+            for cell in clean_row[bb_idx+1:]:
+                if cell != "" and cell != ":":
+                    balance = cell
+                    break
+            if not balance and len(clean_row) > idx_eb:
+                balance = clean_row[idx_eb]
+                
+            parsed_data.append({
+                "ID": "-",
+                "Tanggal": "-",
+                "COA": current_coa,
+                "Nama Akun": current_account,
+                "Memo": memo,
+                "Debit": "-",
+                "Kredit": "-",
+                "Ending Balance": clean_currency(balance)
             })
             continue
-
-        # Transaksi
-        if len(date_val) > 5 and (('/' in date_val) or ('-' in date_val)):
-            cleaned_rows.append({
-                'ID': id_val,
-                'Date': date_val,
-                'Memo': memo_val,
-                'Debit': clean_currency_to_float(row[col_debit]),
-                'Credit': clean_currency_to_float(row[col_credit]),
-                'Ending Balance': clean_currency_to_float(row[col_end_bal]),
-                'Nama Akun': current_account_name
+            
+        if len(clean_row) > idx_id and clean_row[idx_id].isdigit():
+            _id = clean_row[idx_id]
+            _date = clean_row[idx_date] if len(clean_row) > idx_date else ""
+            _memo = clean_row[idx_memo] if len(clean_row) > idx_memo else ""
+            _debit = clean_row[idx_debit] if len(clean_row) > idx_debit else ""
+            _credit = clean_row[idx_credit] if len(clean_row) > idx_credit else ""
+            _eb = clean_row[idx_eb] if len(clean_row) > idx_eb else ""
+            if not _eb and len(clean_row) > idx_eb + 1:
+                _eb = clean_row[idx_eb + 1]
+                
+            parsed_data.append({
+                "ID": _id,
+                "Tanggal": clean_date(_date),
+                "COA": current_coa,
+                "Nama Akun": current_account,
+                "Memo": _memo,
+                "Debit": clean_currency(_debit),
+                "Kredit": clean_currency(_credit),
+                "Ending Balance": clean_currency(_eb)
             })
+            
+    return pd.DataFrame(parsed_data)
 
-    if not cleaned_rows:
-        return None, "Tidak ada data transaksi."
+# ================= UI STREAMLIT =================
 
-    result_df = pd.DataFrame(cleaned_rows)
-    result_df.index = result_df.index + 1 # Start index from 1
-    return result_df, None
+st.set_page_config(page_title="GL Converter Pro", page_icon="📊", layout="wide")
 
-# --- 3. Tampilan UI Utama ---
+st.title("📊 General Ledger Data Extractor (Pro)")
+st.markdown("""
+Aplikasi ini sudah mendukung **Auto-Detect Kolom**. Anda bisa mengunggah file `.txt`, `.csv`, atau `.xlsx` mentah dan sistem akan otomatis mencari posisi data yang tepat.
+""")
 
-# SIDEBAR: Upload & Bantuan
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2920/2920349.png", width=60)
-    st.title("MYOB Cleaner")
-    
-    st.markdown("---")
-    uploaded_file = st.file_uploader("📂 Upload File (Excel/CSV)", type=['xlsx', 'csv'])
-    
-    st.info("💡 **Tips:** Pastikan file adalah export 'General Ledger [Detail]' dari MYOB.")
+uploaded_file = st.file_uploader("Pilih file GL Anda (.txt, .csv, .xlsx, .xls)", type=['csv', 'txt', 'xlsx', 'xls'])
 
-    with st.expander("❓ Bantuan & Format File"):
-        st.markdown("""
-        **Cara Penggunaan:**
-        1. Export laporan GL Detail dari MYOB ke Excel/CSV.
-        2. Upload file di sini.
-        3. Download hasil yang sudah rapi.
-        
-        **Fitur:**
-        - Auto-remove header kotor.
-        - Deteksi Saldo Awal (Beginning Balance).
-        - Format Angka Indonesia.
-        - Download per Akun.
-        """)
+if uploaded_file is not None:
+    try:
+        file_extension = uploaded_file.name.split('.')[-1].lower()
+        data_rows = []
 
-# AREA UTAMA
-st.title("🧹 General Ledger Cleaner")
-st.markdown("Transformasi data MYOB yang berantakan menjadi tabel analisis siap pakai.")
+        # ── TAHAP 1: MEMBACA FILE ──────────────────────────────────────
+        with st.status("📂 Membaca berkas...", expanded=True) as status:
+            st.write(f"🔍 Mendeteksi format file: **{file_extension.upper()}**")
+            time.sleep(0.4)
 
-if uploaded_file:
-    # Menggunakan status container
-    with st.status("🔍 Menganalisis dan membersihkan data...", expanded=True) as status:
-        st.write("Membaca file...")
-        df_result, error = process_myob_file(uploaded_file)
-        
-        if error:
-            status.update(label="Terjadi Kesalahan!", state="error", expanded=True)
-            st.error(error)
+            if file_extension in ['xlsx', 'xls']:
+                st.write("📋 Memuat lembar kerja Excel...")
+                df_raw = pd.read_excel(uploaded_file, header=None)
+                df_raw = df_raw.astype(str).replace('nan', '')
+                data_rows = df_raw.values.tolist()
+            else:
+                st.write("📄 Membaca isi file teks/CSV...")
+                file_content = uploaded_file.getvalue().decode("utf-8", errors="replace")
+                reader = csv.reader(file_content.splitlines())
+                data_rows = list(reader)
+
+            st.write(f"✅ Berhasil membaca **{len(data_rows)}** baris mentah.")
+            time.sleep(0.3)
+            status.update(label="✅ Berkas berhasil dimuat!", state="complete", expanded=False)
+
+        # ── TAHAP 2: CLEANING & PARSING ───────────────────────────────
+        with st.status("⚙️ Memproses dan membersihkan data...", expanded=True) as status:
+            st.write("🧹 Menjalankan auto-detect kolom...")
+            time.sleep(0.3)
+            st.write("💱 Membersihkan format nominal mata uang...")
+            time.sleep(0.3)
+            st.write("📅 Menormalisasi format tanggal...")
+            time.sleep(0.3)
+            st.write("🗂️ Memetakan COA dan nama akun...")
+            time.sleep(0.2)
+
+            df = process_gl_data(data_rows)
+
+            time.sleep(0.2)
+            status.update(label="✅ Proses cleaning selesai!", state="complete", expanded=False)
+
+        # ── TAHAP 3: TAMPILKAN HASIL ───────────────────────────────────
+        if df.empty:
+            st.warning("⚠️ Tidak ada data yang berhasil diekstrak. Pastikan strukturnya sesuai dengan format General Ledger.")
         else:
-            status.update(label="✅ Data berhasil diproses!", state="complete", expanded=False)
+            st.success(f"🎉 Berhasil mengekstrak **{len(df)}** baris data!")
+            st.dataframe(df, use_container_width=True)
 
-    if not error:
-        # Layout Tabs
-        tab1, tab2, tab3 = st.tabs(["📋 Data Cleaned", "📊 Dashboard Ringkasan", "🔍 Filter & Download Akun"])
-        cols_to_format = ['Debit', 'Credit', 'Ending Balance']
+            # ── TAHAP 4: EXPORT ────────────────────────────────────────
+            with st.spinner("📦 Menyiapkan file ekspor Excel..."):
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False, sheet_name='GL_Detail')
+                    worksheet = writer.sheets['GL_Detail']
+                    for i, col in enumerate(df.columns):
+                        column_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                        worksheet.set_column(i, i, min(column_len, 50))
+                processed_data = output.getvalue()
 
-        # --- TAB 1: Data Utama ---
-        with tab1:
-            st.markdown("### 📋 Preview Data Keseluruhan")
-            
-            # Display
-            df_display = df_result.copy()
-            for col in cols_to_format:
-                df_display[col] = df_display[col].apply(format_indo)
-            st.dataframe(df_display, use_container_width=True, height=400)
-            
-            st.divider()
-            st.subheader("📥 Download Semua Data")
-            
-            # Persiapan Data Export
-            df_export = df_result.copy()
-            #for col in cols_to_format:
-            #    df_export[col] = df_export[col].apply(format_indo)
+            st.download_button(
+                label="📥 Export Hasil ke Excel (.xlsx)",
+                data=processed_data,
+                file_name=f"Converted_{uploaded_file.name.split('.')[0]}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
-            c1, c2 = st.columns(2)
-            with c1:
-                csv = df_export.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📄 Download CSV",
-                    data=csv,
-                    file_name='Cleaned_GL_All.csv',
-                    mime='text/csv',
-                    use_container_width=True,
-                    type='primary'
-                )
-            with c2:
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df_export.to_excel(writer, index=False, sheet_name='All Data')
-                st.download_button(
-                    label="📊 Download Excel",
-                    data=buffer.getvalue(),
-                    file_name='Cleaned_GL_All.xlsx',
-                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    use_container_width=True
-                )
-
-        # --- TAB 2: Ringkasan ---
-        with tab2:
-            st.markdown("### 📊 Ringkasan Laporan")
-            
-            # Metrics Row (Hanya 2 kolom, hapus Total Debit)
-            m1, m2 = st.columns(2)
-            with m1:
-                st.metric("Total Baris Data", f"{len(df_result):,}")
-            with m2:
-                st.metric("Jumlah Akun", f"{df_result['Nama Akun'].nunique()}")
-            
-            st.divider()
-            
-            # --- Chart Interaktif ---
-            st.subheader("Grafik Frekuensi Transaksi per Akun")
-            
-            # Persiapkan Data Grafik
-            chart_data = df_result['Nama Akun'].value_counts().reset_index()
-            chart_data.columns = ['Nama Akun', 'Jumlah Transaksi']
-            
-            # Kontrol Chart (Filter & Sort)
-            c_filter1, c_filter2 = st.columns([2, 1])
-            
-            with c_filter2:
-                sort_option = st.radio("Urutkan Berdasarkan:", 
-                                       ["Jumlah Transaksi (Tertinggi)", "Nama Akun (A-Z)"])
-            
-            with c_filter1:
-                all_accounts = chart_data['Nama Akun'].tolist()
-                selected_accounts_chart = st.multiselect(
-                    "Pilih Akun untuk Ditampilkan (Kosongkan untuk memilih semua):",
-                    options=all_accounts,
-                    default=all_accounts # Default semua
-                )
-            
-            # Logika Filter
-            if selected_accounts_chart:
-                chart_df = chart_data[chart_data['Nama Akun'].isin(selected_accounts_chart)]
-            else:
-                chart_df = chart_data # Jika user hapus semua seleksi, tampilkan semua (fallback)
-            
-            # Logika Sorting
-            if sort_option == "Jumlah Transaksi (Tertinggi)":
-                chart_df = chart_df.sort_values(by='Jumlah Transaksi', ascending=False)
-            else:
-                chart_df = chart_df.sort_values(by='Nama Akun', ascending=True)
-            
-            # Tampilkan Grafik
-            st.bar_chart(chart_df.set_index('Nama Akun'), color="#4CAF50")
-            st.caption(f"Menampilkan {len(chart_df)} akun.")
-
-        # --- TAB 3: Filter & Detail ---
-        with tab3:
-            st.markdown("### 🔍 Analisa Per Akun")
-            
-            col_sel, col_empty = st.columns([1, 1])
-            with col_sel:
-                account_list = sorted(df_result['Nama Akun'].dropna().unique().astype(str))
-                selected_account = st.selectbox("Pilih Akun untuk Dianalisis:", account_list)
-            
-            if selected_account:
-                # Filter Data
-                sub_df = df_result[df_result['Nama Akun'] == selected_account].reset_index(drop=True)
-                sub_df.index = sub_df.index + 1 # Index start 1
-                
-                # Kalkulasi
-                beg_bal_row = sub_df[sub_df['Memo'] == 'Beginning Balance']
-                beg_bal_val = beg_bal_row.iloc[0]['Ending Balance'] if not beg_bal_row.empty else 0.0
-                end_bal_val = sub_df.iloc[-1]['Ending Balance'] if not sub_df.empty else 0.0
-                total_rows_account = len(sub_df) # Termasuk saldo awal
-
-                # Tampilan Metrics Akun
-                st.markdown(f"**Ringkasan: {selected_account}**")
-                k1, k2, k3 = st.columns(3)
-                k1.metric("Saldo Awal", f"Rp {format_indo(beg_bal_val)}")
-                k2.metric("Saldo Akhir", f"Rp {format_indo(end_bal_val)}", 
-                          delta=f"{format_indo(end_bal_val - beg_bal_val)} (Perubahan)")
-                k3.metric("Jml Baris", total_rows_account)
-                
-                # Download Per Akun
-                st.markdown("---")
-                col_title, col_btn = st.columns([3, 1])
-                with col_title:
-                    st.write(f"**Detail Transaksi**")
-                with col_btn:
-                    # Logic Download Per Akun
-                    sub_df_export = sub_df.copy()
-                    for col in cols_to_format:
-                        sub_df_export[col] = sub_df_export[col].apply(format_indo)
-                    
-                    buffer_acc = io.BytesIO()
-                    with pd.ExcelWriter(buffer_acc, engine='openpyxl') as writer:
-                        safe_sheet_name = (selected_account[:28] + '..') if len(selected_account) > 30 else selected_account
-                        sub_df_export.to_excel(writer, index=False, sheet_name=safe_sheet_name)
-                    
-                    st.download_button(
-                        label="📥 Download Akun Ini (.xlsx)",
-                        data=buffer_acc.getvalue(),
-                        file_name=f'GL_{selected_account}.xlsx',
-                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        type='primary',
-                        use_container_width=True
-                    )
-
-                # Tampilkan Tabel
-                sub_df_disp = sub_df.copy()
-                for col in cols_to_format:
-                    sub_df_disp[col] = sub_df_disp[col].apply(format_indo)
-                st.dataframe(sub_df_disp, use_container_width=True)
-
-else:
-    # Tampilan awal jika belum upload
-    st.container()
-    st.info("👈 Silakan upload file GL (General Ledger) Anda melalui panel di sebelah kiri untuk memulai.")
+    except Exception as e:
+        st.error(f"❌ Terjadi kesalahan: {e}")
